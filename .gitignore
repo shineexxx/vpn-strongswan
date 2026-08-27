@@ -1,0 +1,12 @@
+# Your filled-in configuration -- holds the domain and contact address.
+vpn.env
+
+# Never commit anything below; they are here as a reminder of what the
+# installed system holds in clear text.
+*.mobileconfig
+*.pem
+vpn-users
+users.conf
+
+# Python bytecode from local syntax checks
+__pycache__/

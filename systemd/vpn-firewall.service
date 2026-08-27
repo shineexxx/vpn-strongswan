@@ -1,0 +1,13 @@
+[Unit]
+Description=IKEv2 VPN firewall rules (NAT, forwarding, MSS clamp)
+After=network-online.target
+Wants=network-online.target
+Before=strongswan.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/vpn-firewall.sh
+
+[Install]
+WantedBy=multi-user.target

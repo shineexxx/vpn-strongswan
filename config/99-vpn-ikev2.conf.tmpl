@@ -1,0 +1,19 @@
+# IKEv2/IPsec VPN forwarding settings -- rendered by install.sh.
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+
+# Turning on IPv6 forwarding makes the kernel stop accepting Router
+# Advertisements, because a router is not supposed to take orders from one.
+# On any host whose own IPv6 address and default route come from SLAAC/RA
+# (Hetzner, DigitalOcean, most clouds) that silently drops the server off IPv6
+# a few minutes after install, when the current RA lease expires.
+#
+# accept_ra = 2 means "accept RA even while forwarding" and is the documented
+# fix. Harmless when the address is configured statically.
+net.ipv6.conf.@WAN_IF@.accept_ra = 2
+
+# The server routes on behalf of its clients; it must not take routing orders
+# from the network it sits on.
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv6.conf.all.accept_redirects = 0

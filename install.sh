@@ -1,0 +1,252 @@
+#!/bin/bash
+# Install the IKEv2/IPsec VPN server on a fresh Debian/Ubuntu host.
+#
+# Idempotent: re-running upgrades the scripts and config in place without
+# touching the user database or the certificate.
+#
+#   sudo ./install.sh                 # full install, obtains a certificate
+#   sudo ./install.sh --no-cert       # everything except certbot
+#   sudo ./install.sh --skip-dns-check
+#   sudo ./install.sh --config /path/to/vpn.env
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_OUT=/etc/vpn-strongswan.env
+
+SRC_ENV="$REPO/vpn.env"
+DO_CERT=1
+DNS_CHECK=1
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --no-cert)        DO_CERT=0 ;;
+        --skip-dns-check) DNS_CHECK=0 ;;
+        --config)         SRC_ENV="${2:?--config needs a path}"; shift ;;
+        -h|--help)        sed -n '2,12p' "$0"; exit 0 ;;
+        *)                echo "unknown option: $1" >&2; exit 1 ;;
+    esac
+    shift
+done
+
+info() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m warn:\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+
+# ---------------------------------------------------------------- preflight
+
+[ "$(id -u)" = 0 ] || die "run as root: sudo ./install.sh"
+command -v apt-get >/dev/null || die "this installer targets Debian/Ubuntu (apt-get not found)"
+[ -r "$SRC_ENV" ] || die "no config at $SRC_ENV -- copy vpn.env.example to vpn.env and edit it"
+
+# shellcheck source=/dev/null
+. "$SRC_ENV"
+
+[ -n "${DOMAIN:-}" ]   || die "DOMAIN is not set in $SRC_ENV"
+[ -n "${POOL4:-}" ]    || die "POOL4 is not set in $SRC_ENV"
+[ "$DO_CERT" = 0 ] || [ -n "${LE_EMAIL:-}" ] || die "LE_EMAIL is not set in $SRC_ENV"
+[ "$DOMAIN" != "vpn.example.com" ] || die "DOMAIN is still the example value -- edit $SRC_ENV"
+
+# WAN interface: whatever carries the default route.
+if [ -z "${WAN_IF:-}" ]; then
+    WAN_IF=$(ip -4 route show default | awk '/dev/ {for(i=1;i<NF;i++) if($i=="dev") print $(i+1); exit}')
+    [ -n "$WAN_IF" ] || die "cannot autodetect WAN_IF -- set it in $SRC_ENV"
+    info "WAN interface: $WAN_IF (autodetected)"
+fi
+ip link show "$WAN_IF" >/dev/null 2>&1 || die "no such interface: $WAN_IF"
+
+# IPv6 is worth having: without it, clients with working IPv6 at home leak that
+# traffic around the tunnel instead of through it.
+case "${ENABLE_IPV6:-auto}" in
+    auto)
+        if ip -6 addr show scope global dev "$WAN_IF" 2>/dev/null | grep -q 'inet6'; then
+            ENABLE_IPV6=1
+        else
+            ENABLE_IPV6=0
+        fi
+        info "IPv6: $([ "$ENABLE_IPV6" = 1 ] && echo enabled || echo "disabled (no global address on $WAN_IF)")"
+        ;;
+    1|yes|true) ENABLE_IPV6=1 ;;
+    *)          ENABLE_IPV6=0 ;;
+esac
+
+# A ULA prefix must be unique per site -- never reuse one across servers.
+if [ "$ENABLE_IPV6" = 1 ] && [ -z "${POOL6:-}" ]; then
+    h=$(head -c 5 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    POOL6="fd${h:0:2}:${h:2:4}:${h:6:4}::/64"
+    info "generated IPv6 pool: $POOL6"
+fi
+POOL6="${POOL6:-fd00:dead:beef::/64}"   # placeholder, unused when ENABLE_IPV6=0
+
+PUBIP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="src") print $(i+1); exit}')
+
+if [ "$DNS_CHECK" = 1 ]; then
+    resolved=$(getent ahostsv4 "$DOMAIN" 2>/dev/null | awk '{print $1; exit}')
+    if [ -z "$resolved" ]; then
+        die "$DOMAIN does not resolve. Point an A record at $PUBIP first, or pass --skip-dns-check."
+    elif [ "$resolved" != "$PUBIP" ]; then
+        warn "$DOMAIN resolves to $resolved but this server is $PUBIP."
+        warn "Let's Encrypt will fail unless that record is fixed or you are behind a 1:1 NAT."
+    else
+        info "DNS: $DOMAIN -> $PUBIP"
+    fi
+fi
+
+# certbot's standalone authenticator binds TCP 80 for a few seconds.
+if [ "$DO_CERT" = 1 ] && ss -Hltn 'sport = :80' 2>/dev/null | grep -q .; then
+    die "something is already listening on TCP 80; certbot --standalone needs it free.
+       Stop that service for the install, or switch this host to the webroot
+       authenticator (see 'Certificate' in README.md)."
+fi
+
+# ---------------------------------------------------------------- packages
+
+info "installing packages"
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y -qq \
+    charon-systemd strongswan-swanctl \
+    libcharon-extra-plugins libcharon-extauth-plugins \
+    iptables iproute2 python3 $([ "$DO_CERT" = 1 ] && echo certbot)
+
+# The legacy starter/ipsec.conf stack fights charon-systemd over the same
+# daemon. Only one may run.
+if systemctl list-unit-files strongswan-starter.service >/dev/null 2>&1 &&
+   [ -n "$(systemctl list-unit-files --no-legend strongswan-starter.service 2>/dev/null)" ]; then
+    systemctl disable --now strongswan-starter.service >/dev/null 2>&1 || true
+    systemctl mask strongswan-starter.service >/dev/null 2>&1 || true
+fi
+
+# ---------------------------------------------------------------- runtime config
+
+info "writing $ENV_OUT"
+umask 022
+cat > "$ENV_OUT" <<EOF
+# Generated by install.sh -- runtime configuration read by every vpn-* script.
+# Re-run install.sh after editing, so the rendered files follow.
+DOMAIN="$DOMAIN"
+LE_EMAIL="${LE_EMAIL:-}"
+WAN_IF="$WAN_IF"
+POOL4="$POOL4"
+POOL6="$POOL6"
+ENABLE_IPV6=$ENABLE_IPV6
+DNS4="${DNS4:-1.1.1.1, 8.8.8.8}"
+DNS6="${DNS6:-2606:4700:4700::1111, 2001:4860:4860::8888}"
+VPN_NAME="${VPN_NAME:-VPN}"
+CREDS_LANG="${CREDS_LANG:-en}"
+EOF
+chmod 0644 "$ENV_OUT"
+
+# ---------------------------------------------------------------- kernel
+
+info "applying sysctl settings"
+sed -e "s|@WAN_IF@|$WAN_IF|g" \
+    "$REPO/config/99-vpn-ikev2.conf.tmpl" > /etc/sysctl.d/99-vpn-ikev2.conf
+sysctl -q -p /etc/sysctl.d/99-vpn-ikev2.conf
+
+# ---------------------------------------------------------------- scripts
+
+info "installing scripts"
+install -m 0755 "$REPO/sbin/vpn-firewall.sh" /usr/local/sbin/vpn-firewall.sh
+install -m 0755 "$REPO/sbin/vpn-user"        /usr/local/sbin/vpn-user
+install -m 0755 "$REPO/sbin/vpn-profile"     /usr/local/sbin/vpn-profile
+install -m 0755 "$REPO/sbin/vpn-reap"        /usr/local/sbin/vpn-reap
+install -d -m 0755 /usr/local/libexec
+install -m 0755 "$REPO/libexec/vpn-sas.py"   /usr/local/libexec/vpn-sas.py
+
+install -d -m 0755 /etc/letsencrypt/renewal-hooks/deploy
+install -m 0755 "$REPO/letsencrypt/10-strongswan.sh" \
+    /etc/letsencrypt/renewal-hooks/deploy/10-strongswan.sh
+
+# ---------------------------------------------------------------- swanctl config
+
+info "rendering /etc/swanctl/conf.d/ikev2.conf"
+install -d -m 0755 /etc/swanctl/conf.d /etc/swanctl/x509 /etc/swanctl/x509ca
+install -d -m 0700 /etc/swanctl/private
+
+POOLS="pool-v4"
+[ "$ENABLE_IPV6" = 1 ] && POOLS="pool-v4, pool-v6"
+
+rendered=$(mktemp)
+sed -e "s|@DOMAIN@|$DOMAIN|g" \
+    -e "s|@POOLS@|$POOLS|g" \
+    -e "s|@POOL4@|$POOL4|g" \
+    -e "s|@POOL6@|$POOL6|g" \
+    -e "s|@DNS4@|${DNS4:-1.1.1.1, 8.8.8.8}|g" \
+    -e "s|@DNS6@|${DNS6:-2606:4700:4700::1111, 2001:4860:4860::8888}|g" \
+    "$REPO/config/ikev2.conf.tmpl" > "$rendered"
+
+target=/etc/swanctl/conf.d/ikev2.conf
+if [ -f "$target" ] && ! cmp -s "$rendered" "$target"; then
+    cp -a "$target" "$target.bak"
+    warn "existing ikev2.conf differed -- previous version saved as $target.bak"
+fi
+install -m 0644 "$rendered" "$target"
+rm -f "$rendered"
+
+# User database. Never truncated on re-run.
+touch /etc/swanctl/vpn-users
+chmod 0600 /etc/swanctl/vpn-users
+
+# /srv/vpn holds generated Apple profiles, which embed passwords in clear text.
+groupadd -f vpn
+install -d -m 0750 -o root -g vpn /srv/vpn
+if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
+    usermod -aG vpn "$SUDO_USER"
+    info "added $SUDO_USER to group 'vpn' (takes effect on next login)"
+fi
+
+# ---------------------------------------------------------------- systemd
+
+info "installing systemd units"
+install -m 0644 "$REPO/systemd/vpn-firewall.service" /etc/systemd/system/
+install -m 0644 "$REPO/systemd/vpn-reap.service"     /etc/systemd/system/
+install -m 0644 "$REPO/systemd/vpn-reap.timer"       /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now vpn-firewall.service
+systemctl enable --now vpn-reap.timer
+
+# ---------------------------------------------------------------- certificate
+
+if [ "$DO_CERT" = 1 ]; then
+    if [ -f "/etc/letsencrypt/live/$DOMAIN/cert.pem" ]; then
+        info "certificate for $DOMAIN already present, not reissuing"
+    else
+        info "obtaining Let's Encrypt certificate for $DOMAIN"
+        certbot certonly --standalone --non-interactive --agree-tos \
+            -m "$LE_EMAIL" -d "$DOMAIN" --key-type rsa --preferred-challenges http
+    fi
+    systemctl enable certbot.timer >/dev/null 2>&1 || true
+fi
+
+if [ -f "/etc/letsencrypt/live/$DOMAIN/cert.pem" ]; then
+    info "deploying certificate into strongSwan"
+    /etc/letsencrypt/renewal-hooks/deploy/10-strongswan.sh
+else
+    warn "no certificate yet -- strongSwan will not start until one exists."
+    warn "obtain it, then run: /etc/letsencrypt/renewal-hooks/deploy/10-strongswan.sh"
+fi
+
+# ---------------------------------------------------------------- start
+
+if [ -f /etc/swanctl/x509/server-cert.pem ]; then
+    info "starting strongSwan"
+    systemctl enable --now strongswan.service
+    systemctl restart strongswan.service
+    sleep 1
+    swanctl --load-all >/dev/null
+    /usr/local/sbin/vpn-user reload >/dev/null
+
+    echo
+    info "done"
+    swanctl --list-conns | head -3 || true
+    echo
+    echo "  Create your first user:"
+    echo "      sudo vpn-user add alice"
+    echo
+    echo "  Apple one-tap profile (optional):"
+    echo "      sudo vpn-profile alice        # -> /srv/vpn/alice.mobileconfig"
+    echo
+else
+    echo
+    warn "install finished but strongSwan was not started (no certificate)."
+fi

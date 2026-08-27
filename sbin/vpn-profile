@@ -1,0 +1,101 @@
+#!/bin/bash
+# Build an Apple .mobileconfig for one VPN user: the IKEv2 connection with the
+# user's credentials embedded, so the device needs no manual setup.
+#
+# The server certificate comes from Let's Encrypt, which every Apple device
+# already trusts, so the profile carries no CA payload.
+#
+# Usage: vpn-profile <name>   ->  /srv/vpn/<name>.mobileconfig
+set -eu
+
+. /etc/vpn-strongswan.env
+
+DB=/etc/swanctl/vpn-users
+# Readable by the "vpn" group so admins do not need root just to fetch a profile.
+OUTDIR=/srv/vpn
+SERVER="$DOMAIN"
+VPNNAME="${VPN_NAME:-VPN}"
+
+umask 077
+name="${1:-}"
+[ -n "$name" ] || { echo "usage: vpn-profile <name>" >&2; exit 1; }
+
+pass=$(awk -F: -v u="$name" '$1==u {print $2; exit}' "$DB")
+[ -n "$pass" ] || { echo "error: no such user: $name" >&2; exit 1; }
+
+uuid() { cat /proc/sys/kernel/random/uuid; }
+# & < > are the only characters that can break the plist string nodes.
+xml() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+# Apple wants a reverse-DNS PayloadIdentifier: vpn.example.com -> com.example.vpn
+revdns() { printf '%s' "$1" | awk -F. '{for(i=NF;i>0;i--) printf "%s%s", $i, (i>1?".":"")}'; }
+
+U=$(xml "$name")
+P=$(xml "$pass")
+ID_PREFIX="$(revdns "$SERVER")"
+
+mkdir -p "$OUTDIR"
+out="$OUTDIR/$name.mobileconfig"
+
+cat > "$out" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>PayloadDisplayName</key><string>$VPNNAME</string>
+    <key>PayloadDescription</key><string>IKEv2 VPN configuration for $U</string>
+    <key>PayloadIdentifier</key><string>$ID_PREFIX.$U</string>
+    <key>PayloadType</key><string>Configuration</string>
+    <key>PayloadUUID</key><string>$(uuid)</string>
+    <key>PayloadVersion</key><integer>1</integer>
+    <key>PayloadRemovalDisallowed</key><false/>
+    <key>PayloadContent</key>
+    <array>
+        <dict>
+            <key>PayloadType</key><string>com.apple.vpn.managed</string>
+            <key>PayloadIdentifier</key><string>$ID_PREFIX.conn</string>
+            <key>PayloadUUID</key><string>$(uuid)</string>
+            <key>PayloadVersion</key><integer>1</integer>
+            <key>PayloadDisplayName</key><string>$VPNNAME</string>
+            <key>UserDefinedName</key><string>$VPNNAME</string>
+            <key>VPNType</key><string>IKEv2</string>
+            <key>IKEv2</key>
+            <dict>
+                <key>RemoteAddress</key><string>$SERVER</string>
+                <key>RemoteIdentifier</key><string>$SERVER</string>
+                <key>LocalIdentifier</key><string>$U</string>
+                <key>AuthenticationMethod</key><string>None</string>
+                <key>ExtendedAuthEnabled</key><integer>1</integer>
+                <key>AuthName</key><string>$U</string>
+                <key>AuthPassword</key><string>$P</string>
+                <key>EnablePFS</key><true/>
+                <key>DisableMOBIKE</key><integer>0</integer>
+                <key>DisableRedirect</key><integer>0</integer>
+                <key>EnableCertificateRevocationCheck</key><integer>0</integer>
+                <key>UseConfigurationAttributeInternalIPSubnet</key><integer>0</integer>
+                <key>DeadPeerDetectionRate</key><string>Medium</string>
+                <key>IKESecurityAssociationParameters</key>
+                <dict>
+                    <key>EncryptionAlgorithm</key><string>AES-256-GCM</string>
+                    <key>IntegrityAlgorithm</key><string>SHA2-384</string>
+                    <key>DiffieHellmanGroup</key><integer>20</integer>
+                    <key>LifeTimeInMinutes</key><integer>240</integer>
+                </dict>
+                <key>ChildSecurityAssociationParameters</key>
+                <dict>
+                    <key>EncryptionAlgorithm</key><string>AES-256-GCM</string>
+                    <key>IntegrityAlgorithm</key><string>SHA2-384</string>
+                    <key>DiffieHellmanGroup</key><integer>20</integer>
+                    <key>LifeTimeInMinutes</key><integer>60</integer>
+                </dict>
+            </dict>
+            <key>OnDemandEnabled</key><integer>0</integer>
+        </dict>
+    </array>
+</dict>
+</plist>
+EOF
+
+# The profile embeds the user's password: group-readable, never world-readable.
+chown root:vpn "$out" 2>/dev/null || true
+chmod 0640 "$out"
+echo "$out"

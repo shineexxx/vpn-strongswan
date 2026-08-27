@@ -1,0 +1,45 @@
+#!/bin/bash
+# Terminate VPN sessions that have carried no traffic for a long time.
+#
+# Why this exists: rekey, reauth and DPD are all disabled server-side, because
+# each of them tore down healthy tunnels of sleeping clients while the client
+# went on believing it was connected. That removed every mechanism that used to
+# reclaim sessions of clients which vanished without sending a DELETE, so those
+# would otherwise hold a pool address forever.
+#
+# This is deliberately far more forgiving than DPD was: DPD killed an SA after
+# ~15 seconds of silence, this waits for two days of zero traffic. A device
+# someone actually uses touches the tunnel long before that.
+#
+# --dry-run prints what would be terminated and changes nothing.
+set -eu
+
+SWANCTL=/usr/sbin/swanctl
+SASPARSE=/usr/local/libexec/vpn-sas.py
+IDLE_SECONDS=${VPN_REAP_IDLE:-172800}      # 48h
+
+dry=0
+[ "${1:-}" = "--dry-run" ] && dry=1
+
+sas=$("$SWANCTL" --list-sas 2>/dev/null || true)
+[ -n "$sas" ] || { echo "vpn-reap: no sessions"; exit 0; }
+
+ids=$(printf '%s\n' "$sas" | "$SASPARSE" --idle "$IDLE_SECONDS")
+if [ -z "$ids" ]; then
+    echo "vpn-reap: nothing idle for ${IDLE_SECONDS}s"
+    exit 0
+fi
+
+n=0
+for id in $ids; do
+    if [ "$dry" = 1 ]; then
+        echo "vpn-reap: would terminate IKE_SA #$id"
+    else
+        # Terminating sends a DELETE, so a client that is merely idle (rather
+        # than gone) learns the session ended instead of black-holing.
+        "$SWANCTL" --terminate --ike-id "$id" --timeout 5 >/dev/null 2>&1 || true
+        echo "vpn-reap: terminated IKE_SA #$id (idle >= ${IDLE_SECONDS}s)"
+    fi
+    n=$((n + 1))
+done
+echo "vpn-reap: $n session(s) handled"
