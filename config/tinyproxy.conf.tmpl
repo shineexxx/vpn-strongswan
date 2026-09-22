@@ -1,0 +1,40 @@
+# HTTP proxy for selective routing -- rendered by install.sh.
+#
+# This proxy is deliberately unreachable from the internet. It binds to the
+# loopback interface only, and the sole way in is an SSH tunnel opened by a key
+# that may forward to this port and do nothing else. That is why there is no
+# authentication here: the SSH layer already decides who gets in, and adding a
+# password would only put one in a config file on both ends.
+
+User tinyproxy
+Group tinyproxy
+
+Port @PROXY_PORT@
+Listen 127.0.0.1
+
+# Connections arrive from the far end of the SSH tunnel, so as far as tinyproxy
+# is concerned every client is local. Anything that is not has no business here.
+Allow 127.0.0.1
+Allow ::1
+
+Timeout 600
+MaxClients 100
+
+LogFile "/var/log/tinyproxy/tinyproxy.log"
+PidFile "/run/tinyproxy/tinyproxy.pid"
+
+# Connect-level logging records which hosts were reached, which is what you need
+# to answer "did that request actually go through the proxy?". Raise to Info
+# while debugging; Connect keeps the log readable over months.
+LogLevel Connect
+
+# Do not announce the hop. The point of routing a request through here is that
+# it should look like an ordinary request from this server.
+DisableViaHeader Yes
+
+# HTTPS arrives as CONNECT. Restricting the destination ports keeps the proxy
+# from being used as a general-purpose relay to arbitrary services if the
+# tunnel key ever leaks. 443 covers the web; 563 is NNTPS, kept because the
+# upstream default ships it. Add ports here if a site you need uses one.
+ConnectPort 443
+ConnectPort 563

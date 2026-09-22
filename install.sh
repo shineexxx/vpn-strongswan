@@ -43,6 +43,15 @@ command -v apt-get >/dev/null || die "this installer targets Debian/Ubuntu (apt-
 
 [ -n "${DOMAIN:-}" ]   || die "DOMAIN is not set in $SRC_ENV"
 [ -n "${POOL4:-}" ]    || die "POOL4 is not set in $SRC_ENV"
+
+case "${ENABLE_PROXY:-0}" in
+    1|yes|true) ENABLE_PROXY=1 ;;
+    *)          ENABLE_PROXY=0 ;;
+esac
+PROXY_PORT="${PROXY_PORT:-8888}"
+case "$PROXY_PORT" in
+    ''|*[!0-9]*) die "PROXY_PORT must be a number, got '$PROXY_PORT'" ;;
+esac
 [ "$DO_CERT" = 0 ] || [ -n "${LE_EMAIL:-}" ] || die "LE_EMAIL is not set in $SRC_ENV"
 [ "$DOMAIN" != "vpn.example.com" ] || die "DOMAIN is still the example value -- edit $SRC_ENV"
 
@@ -106,7 +115,8 @@ apt-get update -qq
 apt-get install -y -qq \
     charon-systemd strongswan-swanctl \
     libcharon-extra-plugins libcharon-extauth-plugins \
-    iptables iproute2 python3 $([ "$DO_CERT" = 1 ] && echo certbot)
+    iptables iproute2 python3 $([ "$DO_CERT" = 1 ] && echo certbot) \
+    $([ "$ENABLE_PROXY" = 1 ] && echo tinyproxy)
 
 # The legacy starter/ipsec.conf stack fights charon-systemd over the same
 # daemon. Only one may run.
@@ -133,6 +143,8 @@ DNS4="${DNS4:-1.1.1.1, 8.8.8.8}"
 DNS6="${DNS6:-2606:4700:4700::1111, 2001:4860:4860::8888}"
 VPN_NAME="${VPN_NAME:-VPN}"
 CREDS_LANG="${CREDS_LANG:-en}"
+ENABLE_PROXY=$ENABLE_PROXY
+PROXY_PORT=$PROXY_PORT
 EOF
 chmod 0644 "$ENV_OUT"
 
@@ -150,6 +162,7 @@ install -m 0755 "$REPO/sbin/vpn-firewall.sh" /usr/local/sbin/vpn-firewall.sh
 install -m 0755 "$REPO/sbin/vpn-user"        /usr/local/sbin/vpn-user
 install -m 0755 "$REPO/sbin/vpn-profile"     /usr/local/sbin/vpn-profile
 install -m 0755 "$REPO/sbin/vpn-reap"        /usr/local/sbin/vpn-reap
+install -m 0755 "$REPO/sbin/vpn-proxy"       /usr/local/sbin/vpn-proxy
 install -d -m 0755 /usr/local/libexec
 install -m 0755 "$REPO/libexec/vpn-sas.py"   /usr/local/libexec/vpn-sas.py
 
@@ -204,6 +217,62 @@ install -m 0644 "$REPO/systemd/vpn-reap.timer"       /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now vpn-firewall.service
 systemctl enable --now vpn-reap.timer
+
+# ---------------------------------------------------------------- proxy
+#
+# An HTTP proxy for selective routing: a client picks which sites go through
+# this server while the rest of its traffic stays on the local network. That is
+# the opposite of what the VPN does, and the two are useful together -- the VPN
+# for everything, the proxy for the handful of sites you want routed when the
+# VPN is off.
+#
+# It listens on loopback only and is reached through an SSH tunnel, so nothing
+# new is exposed to the internet and the firewall rules stay as they were.
+
+if [ "$ENABLE_PROXY" = 1 ]; then
+    info "configuring proxy on 127.0.0.1:$PROXY_PORT"
+
+    sed -e "s|@PROXY_PORT@|$PROXY_PORT|g" \
+        "$REPO/config/tinyproxy.conf.tmpl" > /etc/tinyproxy/tinyproxy.conf
+    chmod 0644 /etc/tinyproxy/tinyproxy.conf
+
+    # The account exists to terminate a port-forward and nothing else, hence
+    # nologin: even if the forced command in authorized_keys were lost, there
+    # would still be no shell to land in.
+    id -u proxyswitch >/dev/null 2>&1 || useradd -m -s /usr/sbin/nologin proxyswitch
+    install -d -m 0700 -o proxyswitch -g proxyswitch /home/proxyswitch/.ssh
+    [ -f /home/proxyswitch/.ssh/authorized_keys ] || \
+        install -m 0600 -o proxyswitch -g proxyswitch /dev/null /home/proxyswitch/.ssh/authorized_keys
+
+    # Authorizing from the config file is what makes a fresh server usable
+    # without a second manual step. Adding later: `vpn-proxy key add "..."`.
+    if [ -n "${PROXY_SSH_KEY:-}" ]; then
+        /usr/local/sbin/vpn-proxy key add "$PROXY_SSH_KEY" || \
+            warn "could not authorize PROXY_SSH_KEY -- check that it is a full public key line"
+    elif [ ! -s /home/proxyswitch/.ssh/authorized_keys ]; then
+        warn "no PROXY_SSH_KEY set and no keys authorized yet -- the proxy is unreachable."
+        warn "add one with: sudo vpn-proxy key add \"ssh-ed25519 AAAA... laptop\""
+    fi
+
+    systemctl enable --now tinyproxy >/dev/null 2>&1 || true
+    systemctl restart tinyproxy
+
+    # A proxy that answers on a public address would be an open relay within
+    # minutes, so this is checked rather than assumed.
+    sleep 1
+    if ss -Hltn "sport = :$PROXY_PORT" 2>/dev/null | awk '{print $4}' | grep -qv '^127\.0\.0\.1:'; then
+        die "tinyproxy is listening beyond loopback -- refusing to leave it that way"
+    fi
+    info "proxy ready (clients tunnel in as user 'proxyswitch')"
+else
+    # Turning it off in the config should actually turn it off, including on a
+    # server where it was enabled before.
+    if systemctl list-unit-files tinyproxy.service >/dev/null 2>&1 &&
+       systemctl is-enabled --quiet tinyproxy 2>/dev/null; then
+        info "ENABLE_PROXY=0 -- stopping the proxy left over from an earlier install"
+        systemctl disable --now tinyproxy >/dev/null 2>&1 || true
+    fi
+fi
 
 # ---------------------------------------------------------------- certificate
 

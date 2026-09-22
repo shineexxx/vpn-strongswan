@@ -18,6 +18,7 @@ info "stopping services"
 systemctl disable --now strongswan.service   >/dev/null 2>&1 || true
 systemctl disable --now vpn-reap.timer       >/dev/null 2>&1 || true
 systemctl disable --now vpn-firewall.service >/dev/null 2>&1 || true
+systemctl disable --now tinyproxy.service    >/dev/null 2>&1 || true
 
 info "flushing VPN firewall rules"
 for t in filter nat mangle; do
@@ -32,7 +33,8 @@ rm -f /etc/systemd/system/vpn-firewall.service \
       /etc/systemd/system/vpn-reap.service \
       /etc/systemd/system/vpn-reap.timer
 rm -f /usr/local/sbin/vpn-firewall.sh /usr/local/sbin/vpn-user \
-      /usr/local/sbin/vpn-profile /usr/local/sbin/vpn-reap
+      /usr/local/sbin/vpn-profile /usr/local/sbin/vpn-reap \
+      /usr/local/sbin/vpn-proxy
 rm -f /usr/local/libexec/vpn-sas.py
 rm -f /etc/letsencrypt/renewal-hooks/deploy/10-strongswan.sh
 rm -f /etc/sysctl.d/99-vpn-ikev2.conf
@@ -45,6 +47,12 @@ if [ "$PURGE" = 1 ]; then
     info "purging user database, profiles and configuration"
     rm -f /etc/swanctl/vpn-users /etc/vpn-strongswan.env
     rm -rf /srv/vpn
+    # The proxy account holds the tunnel keys; dropping it is what actually
+    # revokes them, so it belongs to --purge rather than the default path.
+    if id -u proxyswitch >/dev/null 2>&1; then
+        userdel -r proxyswitch 2>/dev/null || true
+        info "removed the proxyswitch account and its authorized keys"
+    fi
     echo "The Let's Encrypt certificate was left in place. To drop it too:"
     echo "    certbot delete --cert-name \$DOMAIN"
 else

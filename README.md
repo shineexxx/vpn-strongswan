@@ -185,6 +185,11 @@ vpn-user reload                    # re-apply /etc/swanctl/vpn-users
 vpn-profile <name>                 # build .mobileconfig
 vpn-reap --dry-run                 # show which idle sessions would be reclaimed
 
+vpn-proxy status                   # proxy state, exposure, authorized keys
+vpn-proxy key add "ssh-ed25519 …"  # authorize a client to tunnel in
+vpn-proxy key list                 # fingerprints of authorized keys
+vpn-proxy key remove <fragment>    # revoke by comment or fingerprint
+
 swanctl --list-sas                 # raw session list
 swanctl --list-conns               # loaded connection config
 swanctl --list-pools --leases      # pool usage
@@ -208,6 +213,74 @@ Note that `--load-all` adds credentials but does not evict ones already in
 memory, and does not retime SAs that already exist. After replacing a
 certificate or changing timers, use `systemctl restart strongswan` — which drops
 every live tunnel.
+
+---
+
+## Selective routing: the HTTP proxy
+
+The VPN is all-or-nothing: turn it on and every packet leaves through this
+server. That is usually what you want, and sometimes exactly what you don't —
+a bank that dislikes foreign logins, a video service that geoblocks the server's
+country, a slow path to a site that was fine before.
+
+The optional proxy covers the other case. It routes *only* the requests a client
+deliberately sends to it, so you can push a handful of sites through this server
+while everything else takes the local route, with the VPN switched off.
+
+Enable it in `vpn.env` before installing:
+
+```bash
+ENABLE_PROXY=1
+PROXY_PORT=8888
+PROXY_SSH_KEY="ssh-ed25519 AAAAC3Nza... laptop"
+```
+
+`install.sh` then installs tinyproxy, binds it to `127.0.0.1:$PROXY_PORT`,
+creates the unprivileged account `proxyswitch`, and authorizes that key for one
+thing: forwarding to the proxy port.
+
+### Reaching it
+
+The proxy is not published to the internet — there is no open port and no
+password. A client opens an SSH tunnel and talks to its own loopback:
+
+```bash
+ssh -N -L 8888:127.0.0.1:8888 proxyswitch@<server>
+curl -x http://127.0.0.1:8888 https://example.com
+```
+
+Point a browser's proxy setting, a PAC file, or `HTTPS_PROXY` at
+`http://127.0.0.1:8888` and those requests exit from this server.
+
+### Why an SSH tunnel rather than a password
+
+An HTTP proxy on a public address is found by scanners within minutes, and
+`Basic` auth over a proxy is a password sent on every request. Keeping the
+listener on loopback removes the attack surface instead of guarding it, and SSH
+already solves authentication with keys.
+
+The authorization line each key gets is deliberately narrow:
+
+```
+restrict,port-forwarding,permitopen="127.0.0.1:8888",command="/bin/false"
+```
+
+`restrict` drops pty, agent and X11 forwarding; `permitopen` allows exactly one
+forward destination; the forced command closes the remaining gap, because
+`restrict` on its own still permits `ssh host <command>`. A leaked key buys an
+attacker the use of your proxy — not a shell on the machine that routes your
+traffic.
+
+### Notes
+
+* `ConnectPort` in the rendered config limits HTTPS tunnelling to 443 and 563.
+  Add ports there if you need a site on a non-standard one.
+* The log at `/var/log/tinyproxy/tinyproxy.log` records every `CONNECT` and is
+  the only reliable way to answer "did that request really go through the
+  proxy?" — clients fail over to a direct connection more often than you would
+  expect.
+* `ENABLE_PROXY=0` on a re-run stops and disables a proxy from an earlier
+  install; `uninstall.sh --purge` also deletes the account and its keys.
 
 ---
 

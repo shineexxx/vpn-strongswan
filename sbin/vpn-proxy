@@ -1,0 +1,139 @@
+#!/bin/bash
+# Manage access to the selective-routing HTTP proxy.
+#
+# The proxy itself listens on loopback only; reaching it means opening an SSH
+# tunnel as the unprivileged user 'proxyswitch'. This script is how keys get
+# into that account, and it exists because writing authorized_keys by hand is
+# how people accidentally grant a shell on a machine that routes their traffic.
+#
+# Every key added here is pinned to one thing: forwarding to the proxy port.
+# No pty, no agent forwarding, no command execution -- the forced command sees
+# to the last one, since 'restrict' alone still lets `ssh host some-command`
+# run.
+#
+#   vpn-proxy status
+#   vpn-proxy key add "ssh-ed25519 AAAA... laptop"
+#   vpn-proxy key list
+#   vpn-proxy key remove laptop
+set -eu
+
+ENV_FILE=/etc/vpn-strongswan.env
+# shellcheck source=/dev/null
+[ -r "$ENV_FILE" ] && . "$ENV_FILE"
+
+PROXY_USER=proxyswitch
+PROXY_PORT="${PROXY_PORT:-8888}"
+AUTH_KEYS="/home/$PROXY_USER/.ssh/authorized_keys"
+
+die()  { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+info() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
+
+need_root() { [ "$(id -u)" = 0 ] || die "run as root: sudo vpn-proxy $*"; }
+
+options() {
+    printf 'restrict,port-forwarding,permitopen="127.0.0.1:%s",command="/bin/false"' "$PROXY_PORT"
+}
+
+ensure_account() {
+    id -u "$PROXY_USER" >/dev/null 2>&1 || \
+        useradd -m -s /usr/sbin/nologin "$PROXY_USER"
+    install -d -m 0700 -o "$PROXY_USER" -g "$PROXY_USER" "/home/$PROXY_USER/.ssh"
+    [ -f "$AUTH_KEYS" ] || install -m 0600 -o "$PROXY_USER" -g "$PROXY_USER" \
+        /dev/null "$AUTH_KEYS"
+}
+
+# The key body without options or comment, which is what identifies a key
+# regardless of how it was labelled.
+key_body() { awk '{for (i=1;i<=NF;i++) if ($i ~ /^(ssh-|ecdsa-|sk-)/) {print $i, $(i+1); exit}}'; }
+
+cmd_add() {
+    need_root key add
+    local key="${1:-}"
+    [ -n "$key" ] || die "usage: vpn-proxy key add \"ssh-ed25519 AAAA... comment\""
+
+    local body
+    body=$(printf '%s\n' "$key" | key_body)
+    [ -n "$body" ] || die "that does not look like an SSH public key"
+
+    # Validate before writing: a malformed line silently locks the tunnel out.
+    local tmp
+    tmp=$(mktemp)
+    printf '%s\n' "$key" > "$tmp"
+    ssh-keygen -l -f "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; die "key does not parse"; }
+    local fp; fp=$(ssh-keygen -l -f "$tmp" | awk '{print $2}')
+    rm -f "$tmp"
+
+    ensure_account
+    if grep -qF "$body" "$AUTH_KEYS" 2>/dev/null; then
+        info "key already authorized ($fp)"
+        return 0
+    fi
+
+    printf '%s %s\n' "$(options)" "$key" >> "$AUTH_KEYS"
+    chown "$PROXY_USER:$PROXY_USER" "$AUTH_KEYS"
+    chmod 0600 "$AUTH_KEYS"
+    info "authorized $fp"
+}
+
+cmd_remove() {
+    need_root key remove
+    local needle="${1:-}"
+    [ -n "$needle" ] || die "usage: vpn-proxy key remove <comment or fingerprint fragment>"
+    [ -f "$AUTH_KEYS" ] || die "no keys authorized yet"
+
+    local before after
+    before=$(wc -l < "$AUTH_KEYS")
+    grep -vF "$needle" "$AUTH_KEYS" > "$AUTH_KEYS.new" || true
+    mv "$AUTH_KEYS.new" "$AUTH_KEYS"
+    chown "$PROXY_USER:$PROXY_USER" "$AUTH_KEYS"
+    chmod 0600 "$AUTH_KEYS"
+    after=$(wc -l < "$AUTH_KEYS")
+
+    if [ "$before" = "$after" ]; then
+        die "nothing matched '$needle'"
+    fi
+    info "removed $((before - after)) key(s)"
+}
+
+cmd_list() {
+    [ -f "$AUTH_KEYS" ] || { echo "no keys authorized"; return 0; }
+    [ -s "$AUTH_KEYS" ] || { echo "no keys authorized"; return 0; }
+    ssh-keygen -l -f "$AUTH_KEYS" 2>/dev/null || cat "$AUTH_KEYS"
+}
+
+cmd_status() {
+    printf 'proxy:   '
+    if systemctl is-active --quiet tinyproxy; then
+        printf 'running on 127.0.0.1:%s\n' "$PROXY_PORT"
+    else
+        printf '\033[1;33mnot running\033[0m (systemctl status tinyproxy)\n'
+    fi
+
+    printf 'exposure: '
+    if ss -Hltn "sport = :$PROXY_PORT" 2>/dev/null | awk '{print $4}' | grep -qv '^127\.0\.0\.1:'; then
+        printf '\033[1;31mreachable beyond loopback -- check Listen in /etc/tinyproxy/tinyproxy.conf\033[0m\n'
+    else
+        printf 'loopback only\n'
+    fi
+
+    printf 'account:  '
+    id -u "$PROXY_USER" >/dev/null 2>&1 && printf '%s exists\n' "$PROXY_USER" || printf 'missing\n'
+
+    echo "keys:"
+    cmd_list | sed 's/^/  /'
+}
+
+case "${1:-status}" in
+    status) cmd_status ;;
+    key)
+        shift
+        case "${1:-list}" in
+            add)    shift; cmd_add "${1:-}" ;;
+            remove) shift; cmd_remove "${1:-}" ;;
+            list)   cmd_list ;;
+            *)      die "unknown: vpn-proxy key $1" ;;
+        esac
+        ;;
+    -h|--help) sed -n '2,20p' "$0" ;;
+    *) die "unknown command: $1 (try: status, key add|list|remove)" ;;
+esac
