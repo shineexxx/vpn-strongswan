@@ -505,7 +505,12 @@ If those are fine, it is likely the MSS clamp missing or the session-teardown
 behaviour described in [Session handling](#session-handling-and-the-two-bugs-that-shaped-it).
 
 **Some sites load, large pages hang.** MSS clamp. Confirm the mangle rule
-exists, and re-run `vpn-firewall.sh`.
+exists, and re-run `vpn-firewall.sh`. If it is there and big responses (TLS
+handshakes, Microsoft Store, updates) still stall or take seconds, the client's
+path is narrower than the clamp allows: lower `TCP_MSS4`/`TCP_MSS6` in
+`/etc/vpn-strongswan.env` and re-run `vpn-firewall.sh` -- it replaces the old
+clamp. On a Windows client, `netsh interface ipv4 set subinterface "<VPN name>"
+mtu=1300 store=active` is a quick way to confirm the diagnosis first.
 
 **Useful checks:**
 

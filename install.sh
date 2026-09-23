@@ -52,6 +52,14 @@ PROXY_PORT="${PROXY_PORT:-8888}"
 case "$PROXY_PORT" in
     ''|*[!0-9]*) die "PROXY_PORT must be a number, got '$PROXY_PORT'" ;;
 esac
+TCP_MSS4="${TCP_MSS4:-1280}"
+TCP_MSS6="${TCP_MSS6:-1260}"
+for v in TCP_MSS4 TCP_MSS6; do
+    case "${!v}" in
+        ''|*[!0-9]*) die "$v must be a number, got '${!v}'" ;;
+    esac
+    [ "${!v}" -ge 536 ] && [ "${!v}" -le 1460 ] || die "$v must be between 536 and 1460, got ${!v}"
+done
 [ "$DO_CERT" = 0 ] || [ -n "${LE_EMAIL:-}" ] || die "LE_EMAIL is not set in $SRC_ENV"
 [ "$DOMAIN" != "vpn.example.com" ] || die "DOMAIN is still the example value -- edit $SRC_ENV"
 
@@ -145,6 +153,8 @@ VPN_NAME="${VPN_NAME:-VPN}"
 CREDS_LANG="${CREDS_LANG:-en}"
 ENABLE_PROXY=$ENABLE_PROXY
 PROXY_PORT=$PROXY_PORT
+TCP_MSS4=$TCP_MSS4
+TCP_MSS6=$TCP_MSS6
 EOF
 chmod 0644 "$ENV_OUT"
 
