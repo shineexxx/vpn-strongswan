@@ -236,6 +236,13 @@ if [ "$ENABLE_PROXY" = 1 ]; then
         "$REPO/config/tinyproxy.conf.tmpl" > /etc/tinyproxy/tinyproxy.conf
     chmod 0644 /etc/tinyproxy/tinyproxy.conf
 
+    # MaxClients is only half of the capacity story; the open-files limit is the
+    # other half, and its default would cap the proxy well below MaxClients.
+    install -d -m 0755 /etc/systemd/system/tinyproxy.service.d
+    install -m 0644 "$REPO/systemd/tinyproxy-limits.conf" \
+        /etc/systemd/system/tinyproxy.service.d/limits.conf
+    systemctl daemon-reload
+
     # The account exists to terminate a port-forward and nothing else, hence
     # nologin: even if the forced command in authorized_keys were lost, there
     # would still be no shell to land in.

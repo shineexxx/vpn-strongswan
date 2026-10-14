@@ -18,7 +18,15 @@ Allow 127.0.0.1
 Allow ::1
 
 Timeout 600
-MaxClients 100
+
+# Each client is one thread and two file descriptors. 100 looked generous and was
+# not: a browser streaming video holds dozens of parallel connections, CLI agents
+# keep their own pools, and idle tunnels linger for the Timeout above. The proxy
+# sat pinned at exactly 100 and turned clients away ("Maximum number of
+# connections reached") while using under 6 MB of memory. Threads here are cheap;
+# refusals are not. The service's open-files limit is raised to match by the
+# systemd drop-in installed alongside this file.
+MaxClients 1000
 
 LogFile "/var/log/tinyproxy/tinyproxy.log"
 PidFile "/run/tinyproxy/tinyproxy.pid"

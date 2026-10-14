@@ -32,6 +32,7 @@ info "removing files"
 rm -f /etc/systemd/system/vpn-firewall.service \
       /etc/systemd/system/vpn-reap.service \
       /etc/systemd/system/vpn-reap.timer
+rm -rf /etc/systemd/system/tinyproxy.service.d
 rm -f /usr/local/sbin/vpn-firewall.sh /usr/local/sbin/vpn-user \
       /usr/local/sbin/vpn-profile /usr/local/sbin/vpn-reap \
       /usr/local/sbin/vpn-proxy
